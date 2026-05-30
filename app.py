@@ -6,6 +6,7 @@ from io import BytesIO
 import pulp
 import os
 import pickle
+from supabase import create_client
 
 # ============================================================
 # PAGE CONFIG
@@ -129,57 +130,337 @@ PERSISTED_STATE_KEYS = [
 ]
 
 
+INPUT_DB_TO_APP_COLUMNS = {
+    "shipment_id": "Shipment_ID",
+    "destination": "Destination",
+    "shipment_type": "Shipment_Type",
+    "free_entry_date": "Free_Entry_Date",
+    "cutoff_date": "Cutoff_Date",
+    "earliest_dispatch_date": "Earliest_Dispatch_Date",
+    "latest_dispatch_date": "Latest_Dispatch_Date",
+    "vehicle_count": "Vehicle_Count",
+    "priority": "Priority",
+    "preferred_mode": "Preferred_Mode",
+    "source": "Source"
+}
+
+INPUT_APP_TO_DB_COLUMNS = {v: k for k, v in INPUT_DB_TO_APP_COLUMNS.items()}
+
+SCHEDULE_DB_TO_APP_COLUMNS = {
+    "shipment_id": "Shipment_ID",
+    "destination": "Destination",
+    "shipment_type": "Shipment_Type",
+    "recommended_mode": "Recommended_Mode",
+    "dispatch_date": "Dispatch_Date",
+    "arrival_date": "Arrival_Date",
+    "free_entry_date": "Free_Entry_Date",
+    "cutoff_date": "Cutoff_Date",
+    "earliest_dispatch_date": "Earliest_Dispatch_Date",
+    "latest_dispatch_date": "Latest_Dispatch_Date",
+    "slack_before_cutoff": "Slack_Before_Cutoff",
+    "dispatch_deviation": "Dispatch_Deviation",
+    "vehicle_count": "Vehicle_Count",
+    "priority": "Priority",
+    "priority_weight": "Priority_Weight",
+    "risk_score": "Risk_Score",
+    "preferred_mode": "Preferred_Mode",
+    "status": "Status",
+    "manual_override": "Manual_Override",
+    "delay_reason": "Delay_Reason",
+    "manual_warnings": "Manual_Warnings",
+    "source": "Source"
+}
+
+SCHEDULE_APP_TO_DB_COLUMNS = {v: k for k, v in SCHEDULE_DB_TO_APP_COLUMNS.items()}
+
+SUMMARY_DB_TO_APP_COLUMNS = {
+    "dispatch_date": "Dispatch_Date",
+    "daily_total_vehicles": "Daily_Total_Vehicles",
+    "number_of_shipments": "Number_of_Shipments",
+    "port_shipments": "Port_Shipments",
+    "target_shipments": "Target_Shipments",
+    "rail_shipments": "Rail_Shipments",
+    "road_shipments": "Road_Shipments",
+    "over_capacity": "Over_Capacity"
+}
+
+SUMMARY_APP_TO_DB_COLUMNS = {v: k for k, v in SUMMARY_DB_TO_APP_COLUMNS.items()}
+
+
+def get_supabase_client():
+    """
+    Returns a Supabase client if secrets are configured.
+    If secrets are not available, the app falls back to local pickle storage.
+    """
+    try:
+        supabase_url = st.secrets["SUPABASE_URL"]
+        supabase_key = st.secrets["SUPABASE_KEY"]
+        return create_client(supabase_url, supabase_key)
+    except Exception:
+        return None
+
+
+def _convert_value_for_db(value):
+    """
+    Converts pandas/numpy values into Supabase-compatible Python values.
+    """
+    if pd.isna(value):
+        return None
+
+    if isinstance(value, pd.Timestamp):
+        return value.date().isoformat()
+
+    if hasattr(value, "isoformat") and value.__class__.__name__ in ["date", "datetime"]:
+        return value.isoformat()
+
+    if hasattr(value, "item"):
+        try:
+            return value.item()
+        except Exception:
+            pass
+
+    return value
+
+
+def _df_to_supabase_records(df, app_to_db_columns):
+    """
+    Converts an app dataframe to a list of dictionaries matching Supabase column names.
+    """
+    if df is None or df.empty:
+        return []
+
+    work_df = df.copy()
+    records = []
+
+    for _, row in work_df.iterrows():
+        record = {}
+
+        for app_col, db_col in app_to_db_columns.items():
+            if app_col in work_df.columns:
+                record[db_col] = _convert_value_for_db(row.get(app_col))
+
+        records.append(record)
+
+    return records
+
+
+def _supabase_records_to_df(records, db_to_app_columns):
+    """
+    Converts Supabase records into app dataframe column names.
+    """
+    if not records:
+        return pd.DataFrame(columns=list(db_to_app_columns.values()))
+
+    df = pd.DataFrame(records)
+
+    # Remove Supabase metadata columns if present.
+    drop_cols = [col for col in ["id", "created_at", "updated_at"] if col in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
+    df = df.rename(columns=db_to_app_columns)
+
+    return df
+
+
+def _delete_all_rows(supabase, table_name):
+    """
+    Deletes all rows from a Supabase table.
+    The id column is positive bigserial, so id >= 0 clears the table.
+    """
+    try:
+        supabase.table(table_name).delete().gte("id", 0).execute()
+    except Exception:
+        # Empty tables or API differences should not break the app.
+        pass
+
+
 def save_app_state():
     """
-    Saves current input, optimization result, calendar, and summary data locally.
-    This allows the app to reopen with the previous calendar and inputs.
+    Saves current input, optimization result, and daily summary.
+    On Streamlit Cloud, it saves to Supabase.
+    If Supabase secrets are missing, it falls back to local pickle storage.
     """
-    state_to_save = {}
+    supabase = get_supabase_client()
 
-    for key in PERSISTED_STATE_KEYS:
-        if key in st.session_state:
-            state_to_save[key] = st.session_state[key]
+    if supabase is None:
+        state_to_save = {}
 
-    with open(STATE_FILE, "wb") as f:
-        pickle.dump(state_to_save, f)
+        for key in PERSISTED_STATE_KEYS:
+            if key in st.session_state:
+                state_to_save[key] = st.session_state[key]
+
+        with open(STATE_FILE, "wb") as f:
+            pickle.dump(state_to_save, f)
+
+        return
+
+    try:
+        # INPUT SHIPMENTS
+        _delete_all_rows(supabase, "input_shipments")
+        input_records = _df_to_supabase_records(
+            st.session_state.input_df,
+            INPUT_APP_TO_DB_COLUMNS
+        )
+        if input_records:
+            supabase.table("input_shipments").upsert(
+                input_records,
+                on_conflict="shipment_id"
+            ).execute()
+
+        # SCHEDULED SHIPMENTS
+        _delete_all_rows(supabase, "scheduled_shipments")
+        schedule_records = _df_to_supabase_records(
+            st.session_state.output_df,
+            SCHEDULE_APP_TO_DB_COLUMNS
+        )
+        if schedule_records:
+            supabase.table("scheduled_shipments").upsert(
+                schedule_records,
+                on_conflict="shipment_id"
+            ).execute()
+
+        # DAILY SUMMARY
+        _delete_all_rows(supabase, "daily_summary")
+        summary_records = _df_to_supabase_records(
+            st.session_state.daily_summary,
+            SUMMARY_APP_TO_DB_COLUMNS
+        )
+        if summary_records:
+            supabase.table("daily_summary").upsert(
+                summary_records,
+                on_conflict="dispatch_date"
+            ).execute()
+
+    except Exception as e:
+        st.warning(f"Supabase save failed: {e}")
 
 
 def load_app_state_once():
     """
-    Loads previously saved state only once when the Streamlit app starts.
+    Loads saved input, schedule, and daily summary only once when the app starts.
+    On Streamlit Cloud, it loads from Supabase.
+    If Supabase secrets are missing, it falls back to local pickle storage.
     """
     if st.session_state.get("state_loaded", False):
         return
 
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "rb") as f:
-                saved_state = pickle.load(f)
+    supabase = get_supabase_client()
 
-            for key, value in saved_state.items():
-                st.session_state[key] = value
+    if supabase is None:
+        if os.path.exists(STATE_FILE):
+            try:
+                with open(STATE_FILE, "rb") as f:
+                    saved_state = pickle.load(f)
 
-        except Exception as e:
-            st.warning(f"Saved state could not be loaded: {e}")
+                for key, value in saved_state.items():
+                    st.session_state[key] = value
+
+            except Exception as e:
+                st.warning(f"Saved state could not be loaded: {e}")
+
+        st.session_state.state_loaded = True
+        return
+
+    try:
+        input_response = supabase.table("input_shipments").select("*").execute()
+        schedule_response = supabase.table("scheduled_shipments").select("*").execute()
+        summary_response = supabase.table("daily_summary").select("*").execute()
+
+        loaded_input_df = _supabase_records_to_df(
+            input_response.data,
+            INPUT_DB_TO_APP_COLUMNS
+        )
+        loaded_schedule_df = _supabase_records_to_df(
+            schedule_response.data,
+            SCHEDULE_DB_TO_APP_COLUMNS
+        )
+        loaded_summary_df = _supabase_records_to_df(
+            summary_response.data,
+            SUMMARY_DB_TO_APP_COLUMNS
+        )
+
+        if not loaded_input_df.empty:
+            st.session_state.input_df = normalize_input_for_session(loaded_input_df)
+
+        if not loaded_schedule_df.empty:
+            for col in [
+                "Dispatch_Date",
+                "Arrival_Date",
+                "Free_Entry_Date",
+                "Cutoff_Date",
+                "Earliest_Dispatch_Date",
+                "Latest_Dispatch_Date"
+            ]:
+                if col in loaded_schedule_df.columns:
+                    loaded_schedule_df[col] = pd.to_datetime(
+                        loaded_schedule_df[col],
+                        errors="coerce"
+                    )
+
+            st.session_state.output_df = loaded_schedule_df
+
+        if not loaded_summary_df.empty:
+            if "Dispatch_Date" in loaded_summary_df.columns:
+                loaded_summary_df["Dispatch_Date"] = pd.to_datetime(
+                    loaded_summary_df["Dispatch_Date"],
+                    errors="coerce"
+                )
+            st.session_state.daily_summary = loaded_summary_df
+
+        st.session_state.needs_optimization = False
+
+        if not st.session_state.output_df.empty:
+            st.session_state.calendar_week_start = get_week_start_from_output(
+                st.session_state.output_df
+            )
+
+    except Exception as e:
+        st.warning(f"Supabase load failed: {e}")
 
     st.session_state.state_loaded = True
 
 
 def clear_saved_state():
     """
-    Deletes saved app state from disk.
-    Useful when the user wants to start from zero.
+    Deletes saved app state from Supabase if configured.
+    Otherwise deletes the local pickle file.
     """
-    if os.path.exists(STATE_FILE):
-        os.remove(STATE_FILE)
+    supabase = get_supabase_client()
 
-    for key in PERSISTED_STATE_KEYS:
-        if key in st.session_state:
-            if key.endswith("_df") or key in ["input_df", "output_df", "daily_summary", "objective_summary", "validation_df", "options_df"]:
-                st.session_state[key] = pd.DataFrame()
+    if supabase is None:
+        if os.path.exists(STATE_FILE):
+            os.remove(STATE_FILE)
+    else:
+        try:
+            _delete_all_rows(supabase, "daily_summary")
+            _delete_all_rows(supabase, "scheduled_shipments")
+            _delete_all_rows(supabase, "input_shipments")
+        except Exception as e:
+            st.warning(f"Supabase clear failed: {e}")
 
+    st.session_state.input_df = pd.DataFrame(columns=[
+        "Shipment_ID",
+        "Destination",
+        "Shipment_Type",
+        "Free_Entry_Date",
+        "Cutoff_Date",
+        "Earliest_Dispatch_Date",
+        "Latest_Dispatch_Date",
+        "Vehicle_Count",
+        "Priority",
+        "Preferred_Mode",
+        "Source"
+    ])
+    st.session_state.output_df = pd.DataFrame()
+    st.session_state.daily_summary = pd.DataFrame()
+    st.session_state.objective_summary = pd.DataFrame()
+    st.session_state.validation_df = pd.DataFrame()
+    st.session_state.options_df = pd.DataFrame()
     st.session_state.last_uploaded_file_id = None
     st.session_state.needs_optimization = False
+
+
 def normalize_date(value):
     if pd.isna(value) or value == "":
         return pd.NaT
